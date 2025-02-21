@@ -39,6 +39,7 @@
     "shx": "^0.3.4",
     "tsx": "^4.19.2",
     "typescript": "^5.6.2",
+    "@types/node": "^22.13.4",
     "@types/turndown": "^5.0.4"
   }
 }

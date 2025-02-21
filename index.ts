@@ -880,16 +880,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                         await Promise.all([
                             page.keyboard.press('Enter'),
                             page.waitForLoadState('networkidle', { timeout: 15000 }),
+                            page.waitForLoadState('domcontentloaded'),
+                            // Wait for any of the possible result containers
+                            Promise.race([
+                                page.waitForSelector('div.g', { timeout: 10000 }).catch(() => null),
+                                page.waitForSelector('div[jscontroller][jsdata]', { timeout: 10000 }).catch(() => null),
+                                page.waitForSelector('div[class*="MjjYud"]', { timeout: 10000 }).catch(() => null),
+                                page.waitForSelector('div.rc', { timeout: 10000 }).catch(() => null),
+                                page.waitForSelector('div[data-sokoban-container]', { timeout: 10000 }).catch(() => null)
+                            ])
                         ]);
+                        // Add a small delay to ensure dynamic content is loaded
+                        await page.waitForTimeout(2000);
                     });
 
                     // Step 5: Extract search results
                     const searchResults = await withRetry(async () => {
                         const results = await page.evaluate(() => {
-                            // Find all search result containers
-                            const elements = document.querySelectorAll('div.g');
+                            // Try multiple possible selectors for search results
+                            const selectors = [
+                                'div.g',  // Traditional selector
+                                'div[jscontroller][jsdata][jsaction*="click"]',  // Modern dynamic results
+                                'div[class*="MjjYud"]',  // Another common pattern
+                                'div.rc',  // Alternative result container
+                                'div[data-sokoban-container]' // Dynamic container
+                            ];
+                            let elements = null;
+                            for (const selector of selectors) {
+                                const found = document.querySelectorAll(selector);
+                                if (found && found.length > 0) {
+                                    elements = found;
+                                    break;
+                                }
+                            }
                             if (!elements || elements.length === 0) {
-                                throw new Error('No search results found');
+                                throw new Error('No search results found with any known selector');
                             }
 
                             // Extract data from each result
@@ -1198,16 +1223,68 @@ async function ensureBrowser(): Promise<Page> {
     if (!browser) {
         browser = await chromium.launch({
             headless: true,  // Run in headless mode for automation
+            args: [
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-site-isolation-trials'
+            ]
         });
-
-        // Create initial context and page
-        const context = await browser.newContext();
-        page = await context.newPage();
     }
 
-    // Create new page if current one is closed/invalid
+    // Create new context with enhanced configuration if page is not valid
     if (!page) {
-        const context = await browser.newContext();
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport: { width: 1280, height: 720 },
+            deviceScaleFactor: 1,
+            hasTouch: false,
+            isMobile: false,
+            locale: 'en-US',
+            permissions: ['geolocation'],
+            javaScriptEnabled: true,
+            bypassCSP: true,  // Bypass Content Security Policy
+            ignoreHTTPSErrors: true  // Handle HTTPS errors gracefully
+        });
+
+        // Configure context to handle resources efficiently
+        await context.route('**/*', async (route) => {
+            const resourceType = route.request().resourceType();
+            // Skip loading unnecessary resources
+            if (['image', 'media', 'font', 'other'].includes(resourceType)) {
+                await route.abort();
+            } else {
+                await route.continue();
+            }
+        });
+
+        // Add custom scripts to mask automation
+        await context.addInitScript(() => {
+            // Override properties that could reveal automation
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            // Overwrite permissions query
+            const originalQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+            window.navigator.permissions.query = function(parameters: PermissionDescriptor): Promise<PermissionStatus> {
+                if (parameters.name === 'notifications') {
+                    // Convert NotificationPermission to PermissionState
+                    const permissionState: PermissionState =
+                        Notification.permission === 'default' ? 'prompt' :
+                        Notification.permission as PermissionState;
+
+                    const result: PermissionStatus = {
+                        name: 'notifications',
+                        state: permissionState,
+                        onchange: null,
+                        addEventListener: function() {},
+                        removeEventListener: function() {},
+                        dispatchEvent: function() { return true; }
+                    };
+                    return Promise.resolve(result);
+                }
+                return originalQuery(parameters);
+            };
+        });
+
         page = await context.newPage();
     }
 
