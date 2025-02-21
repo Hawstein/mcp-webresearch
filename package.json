@@ -1,11 +1,11 @@
 {
-  "name": "@mzxrai/mcp-webresearch",
-  "version": "0.1.7",
+  "name": "@claudemind/mcp-webresearch",
+  "version": "0.1.8",
   "description": "MCP server for web research",
   "license": "MIT",
-  "author": "mzxrai",
-  "homepage": "https://github.com/mzxrai/mcp-webresearch",
-  "bugs": "https://github.com/mzxrai/mcp-webresearch/issues",
+  "author": "Hawstein",
+  "homepage": "https://github.com/Hawstein/mcp-webresearch",
+  "bugs": "https://github.com/Hawstein/mcp-webresearch/issues",
   "type": "module",
   "bin": {
     "mcp-server-webresearch": "dist/index.js"
