@@ -4,6 +4,9 @@ A Model Context Protocol (MCP) server for web research.
 
 Bring real-time info into Claude and easily research any topic.
 
+> This is a Fork of [mzxrai/mcp-webresearch](https://github.com/mzxrai/mcp-webresearch). All credit for this project belongs to [mzxrai](https://github.com/mzxrai).
+> I'm just a quick fixer of the project's bugs, and just want to make this awesome project work!
+
 ## Features
 
 - Google search integration
