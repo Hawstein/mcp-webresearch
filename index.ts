@@ -258,8 +258,8 @@ async function dismissGoogleConsent(page: Page): Promise<void> {
         '.google.pt', '.google.gr', '.google.com.tr',
         // Asia Pacific
         '.google.co.id', '.google.com.sg', '.google.co.th',
-        '.google.com.my', '.google.com.ph', '.google.com.au',
-        '.google.co.nz', '.google.com.vn',
+        '.google.com.my', '.google.com.ph', '.google.co.nz',
+        '.google.com.vn',
         // Generic domains
         '.google.com', '.google.co'
     ];
@@ -841,8 +841,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
             const { query } = request.params.arguments as { query: string };
 
             try {
+                // Define expected result structure
+                type SearchResultItem = {
+                    title: string;
+                    url: string;
+                    snippet: string;
+                };
+
                 // Execute search with retry mechanism
-                const results = await withRetry(async () => {
+                const results: SearchResultItem[] = await withRetry(async () => {
                     // Step 1: Navigate to Google search page
                     await safePageNavigation(page, 'https://www.google.com');
                     await dismissGoogleConsent(page);
@@ -894,61 +901,114 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                         await page.waitForTimeout(2000);
                     });
 
-                    // Step 5: Extract search results
-                    const searchResults = await withRetry(async () => {
-                        const results = await page.evaluate(() => {
-                            // Try multiple possible selectors for search results
+                    // Step 5: Extract search results (with inner retry)
+                    const searchResults: SearchResultItem[] = await withRetry(async () => {
+                        const evaluatedResults = await page.evaluate((): (SearchResultItem | null)[] => {
+                            // Try multiple possible selectors for search result containers
                             const selectors = [
-                                'div.g',  // Traditional selector
-                                'div[jscontroller][jsdata][jsaction*="click"]',  // Modern dynamic results
-                                'div[class*="MjjYud"]',  // Another common pattern
-                                'div.rc',  // Alternative result container
-                                'div[data-sokoban-container]' // Dynamic container
+                                'div.MjjYud', // Common container
+                                'div.g', // Traditional container
+                                'div.hlcw0c', // Another possible container
+                                'div.kvH3mc', // Container often seen with featured snippets/PAA
+                                'div[jscontroller][jsdata][jsaction*="click"]', // Modern dynamic results container
                             ];
-                            let elements = null;
+                            let elements: NodeListOf<Element> | null = null;
                             for (const selector of selectors) {
                                 const found = document.querySelectorAll(selector);
+                                // Simple check: If MjjYud is found, prioritize it but check others too
                                 if (found && found.length > 0) {
-                                    elements = found;
-                                    break;
+                                    if (selector === 'div.MjjYud' || !elements) {
+                                         elements = found;
+                                    }
                                 }
                             }
-                            if (!elements || elements.length === 0) {
-                                throw new Error('No search results found with any known selector');
+
+                                    // Fallback if specific containers fail
+                                    if (!elements || elements.length === 0) {
+                                        elements = document.querySelectorAll('div[data-hveid]'); // General attribute often on result blocks
+                                        if (!elements || elements.length === 0) {
+                                           throw new Error('No search result containers found with known selectors');
+                                        }
+                                    }
+
+                                    // Extract data from each result element
+                                    return Array.from(elements).map((el): SearchResultItem | null => {
+                                        // Find link element (often contains the h3 title)
+                                        // Look for the anchor directly containing the main link/heading
+                                        const linkEl = el.querySelector('a[jsname="UWckNb"]') || el.querySelector('a[href]'); // Prioritize specific jsname if available
+
+                                        // Find title element (usually h3 within the link)
+                                        const titleEl = el.querySelector('h3');
+
+                                        // Find snippet element - This is the most likely to change
+                                        let snippetEl = el.querySelector('div.VwiC3b') || // Old common class
+                                                       el.querySelector('div.Ap5OSd') || // Another potential snippet class
+                                                       el.querySelector('div[data-sncf="1"]') || // Attribute-based
+                                                       el.querySelector('span.aCOpRe'); // Snippet often within spans
+
+                                        // More robust snippet finding: find the text block usually after the title/link
+                                        if (!snippetEl) {
+                                             // Look for a div containing text directly under the main result block, avoiding promos/ads
+                                             const potentialSnippets = el.querySelectorAll('div[role="textbox"], div[data-content-feature="1"], div.mu8Lbd, div.w1C3Le'); // Added more potential classes
+                                             for(const p of potentialSnippets) {
+                                                 // Basic check for meaningful content length
+                                                 if (p.textContent && p.textContent.trim().length > 15) {
+                                                     snippetEl = p;
+                                                     break;
+                                                 }
+                                             }
+                                         }
+
+                                        // Skip results missing core elements (title and link are essential)
+                                        // Also check if the link element has a valid href
+                                        if (!titleEl || !linkEl || !linkEl.getAttribute('href') || linkEl.getAttribute('href') === '#') {
+                                            return null;
+                                        }
+
+                                        // Get URL, ensuring it's absolute
+                                        let url = linkEl.getAttribute('href') || '';
+                                        // Handle relative URLs, potentially from /url?q= prefix
+                                        if (url.startsWith('/url?q=')) {
+                                            const urlParams = new URLSearchParams(url.split('?')[1]);
+                                            url = urlParams.get('q') || url; // Extract the actual URL
+                                        } else if (url.startsWith('/')) {
+                                             url = `https://www.google.com${url}`;
+                                         }
+
+
+                                        // Return structured result data
+                                        return {
+                                            title: titleEl.textContent || '',
+                                            url: url,
+                                            // Use snippet text, or empty string if snippet element not found
+                                            snippet: snippetEl ? snippetEl.textContent || '' : '',
+                                        };
+                                        // Filter out invalid results (null, missing title/url, or very short snippets suggesting it's not a real result)
+                                    }).filter((result): result is SearchResultItem =>
+                                        result !== null &&
+                                        !!result.url &&
+                                        !!result.title &&
+                                        !(result.url.startsWith('https://www.google.com/search?q=')) // Filter out "Related searches" etc.
+                                    );
+                                }); // End of page.evaluate
+
+                        const filteredResults = evaluatedResults.filter((r): r is SearchResultItem => r !== null);
+
+                        // Verify we found valid results after filtering
+                        if (!filteredResults || filteredResults.length === 0) {
+                            const pageText = await page.textContent('body');
+                            if (pageText && pageText.length > 100) {
+                                 throw new Error(`No valid search results found using known structures. Page content might have changed. Raw text length: ${pageText.length}`);
+                            } else {
+                                throw new Error('No valid search results found, and page seems empty or blocked.');
                             }
-
-                            // Extract data from each result
-                            return Array.from(elements).map((el) => {
-                                // Find required elements within result container
-                                const titleEl = el.querySelector('h3');            // Title element
-                                const linkEl = el.querySelector('a');              // Link element
-                                const snippetEl = el.querySelector('div.VwiC3b');  // Snippet element
-
-                                // Skip results missing required elements
-                                if (!titleEl || !linkEl || !snippetEl) {
-                                    return null;
-                                }
-
-                                // Return structured result data
-                                return {
-                                    title: titleEl.textContent || '',        // Result title
-                                    url: linkEl.getAttribute('href') || '',  // Result URL
-                                    snippet: snippetEl.textContent || '',    // Result description
-                                };
-                            }).filter(result => result !== null);  // Remove invalid results
-                        });
-
-                        // Verify we found valid results
-                        if (!results || results.length === 0) {
-                            throw new Error('No valid search results found');
                         }
-
-                        // Return compiled list of results
-                        return results;
-                    });
+                        // Now filteredResults is guaranteed to be SearchResultItem[]
+                        return filteredResults;
+                    }); // End of withRetry for search results extraction
 
                     // Step 6: Store results in session
-                    searchResults.forEach((result) => {
+                    searchResults.forEach((result: SearchResultItem) => {
                         addResult({
                             url: result.url,
                             title: result.title,
@@ -959,26 +1019,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
 
                     // Return compiled list of results
                     return searchResults;
-                });
+                }); // End of withRetry for results
 
-                // Step 7: Return formatted results
-                return {
+                // Step 7: Return formatted results (Type: ToolResult)
+                const toolResult: ToolResult = {
                     content: [{
                         type: "text",
                         text: JSON.stringify(results, null, 2)  // Pretty-print JSON results
                     }]
                 };
+                return toolResult;
             } catch (error) {
-                // Handle and format search errors
-                return {
+                // Handle and format search errors (Type: ToolResult)
+                const errorResult: ToolResult = {
                     content: [{
                         type: "text",
                         text: `Failed to perform search: ${(error as Error).message}`
                     }],
                     isError: true
                 };
+                return errorResult;
             }
-        }
+        } // End of case "search_google"
 
         // Handle webpage visit and content extraction
         case "visit_page": {
@@ -990,13 +1052,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
 
             // Step 1: Validate URL format and security
             if (!isValidUrl(url)) {
-                return {
+                const errorResult: ToolResult = {
                     content: [{
                         type: "text" as const,
                         text: `Invalid URL: ${url}. Only http and https protocols are supported.`
                     }],
                     isError: true
                 };
+                return errorResult;
             }
 
             try {
@@ -1066,16 +1129,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
 
                 return response;
             } catch (error) {
-                // Handle and format page visit errors
-                return {
+                // Handle and format page visit errors (Type: ToolResult)
+                const errorResult: ToolResult = {
                     content: [{
                         type: "text" as const,
                         text: `Failed to visit page: ${(error as Error).message}`
                     }],
-                    isError: true
+                    isError: true // Ensure this is boolean
                 };
+                 return errorResult;
             }
-        }
+        } // End of case "visit_page"
 
         // Handle standalone screenshot requests
         case "take_screenshot": {
@@ -1124,18 +1188,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                         type: "text" as const,
                         text: `Screenshot taken successfully. You can view it via *MCP Resources* (Paperclip icon) @ URI: ${resourceUri}`
                     }]
-                };
+                }; // This is ToolResult
             } catch (error) {
-                // Handle and format screenshot errors
-                return {
+                // Handle and format screenshot errors (Type: ToolResult)
+                const errorResult: ToolResult = {
                     content: [{
                         type: "text" as const,
                         text: `Failed to take screenshot: ${(error as Error).message}`
                     }],
-                    isError: true
+                    isError: true // Ensure this is boolean
                 };
+                return errorResult;
             }
-        }
+        } // End of case "take_screenshot"
 
         // Handle unknown tool requests
         default:
@@ -1143,8 +1208,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request): Promise<ToolRes
                 ErrorCode.MethodNotFound,
                 `Unknown tool: ${request.params.name}`
             );
-    }
-});
+    } // End of switch
+}); // End of setRequestHandler for CallToolRequestSchema
 
 // Register handler for prompt listing requests
 server.setRequestHandler(ListPromptsRequestSchema, async () => {
